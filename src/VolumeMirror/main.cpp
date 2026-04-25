@@ -182,10 +182,56 @@ std::wstring ReadStringValue(HKEY root, const std::wstring& path, const std::wst
     return value;
 }
 
-void WriteEapoPreampFromState(DWORD scalarMilli, DWORD muteDword)
+DWORD ReadDwordValue(HKEY root, const std::wstring& path, const std::wstring& valueName, DWORD defaultValue)
 {
-    const double scalar = static_cast<double>(std::clamp<DWORD>(scalarMilli, 0, 1000)) / 1000.0;
-    const double gain = (muteDword != 0) ? 0.0 : scalar;
+    HKEY key = nullptr;
+    const LONG openResult = RegOpenKeyExW(root, path.c_str(), 0, KEY_QUERY_VALUE, &key);
+    if (openResult != ERROR_SUCCESS)
+    {
+        return defaultValue;
+    }
+
+    DWORD valueType = 0;
+    DWORD value = defaultValue;
+    DWORD bytes = sizeof(value);
+    const LONG readResult = RegQueryValueExW(
+        key,
+        valueName.c_str(),
+        nullptr,
+        &valueType,
+        reinterpret_cast<LPBYTE>(&value),
+        &bytes);
+
+    RegCloseKey(key);
+    if (readResult != ERROR_SUCCESS || valueType != REG_DWORD || bytes != sizeof(value))
+    {
+        return defaultValue;
+    }
+
+    return value;
+}
+
+void WriteEapoPreampFromState(const std::wstring& registryPath, DWORD scalarMilli, DWORD muteDword)
+{
+    const DWORD minGainMilliRaw = ReadDwordValue(
+        HKEY_LOCAL_MACHINE,
+        registryPath,
+        std::wstring(equalizer_bridge::shared_config::kRegistryValueMinGainMilli),
+        0);
+    const DWORD maxGainMilliRaw = ReadDwordValue(
+        HKEY_LOCAL_MACHINE,
+        registryPath,
+        std::wstring(equalizer_bridge::shared_config::kRegistryValueMaxGainMilli),
+        1000);
+
+    const DWORD minGainMilli = std::clamp<DWORD>(minGainMilliRaw, 0, 3000);
+    const DWORD maxGainMilli = std::clamp<DWORD>(maxGainMilliRaw, 0, 3000);
+    const DWORD rangeLow = std::min(minGainMilli, maxGainMilli);
+    const DWORD rangeHigh = std::max(minGainMilli, maxGainMilli);
+    const DWORD scalarClamped = std::clamp<DWORD>(scalarMilli, 0, 1000);
+    const DWORD mappedGainMilli = rangeLow + ((rangeHigh - rangeLow) * scalarClamped + 500) / 1000;
+
+    const double gain = (muteDword != 0) ? 0.0 : (static_cast<double>(mappedGainMilli) / 1000.0);
     const double gainDb = (gain < 0.000001) ? -120.0 : (20.0 * std::log10(gain));
 
     FILE* file = nullptr;
@@ -733,7 +779,7 @@ int RunVolumeMirror(const Options& options, bool interactiveConsole)
 
     WriteDwordValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueVolumeScalar), static_cast<DWORD>(scalar * 1000.0f + 0.5f));
     WriteDwordValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueMute), muted ? 1U : 0U);
-    WriteEapoPreampFromState(static_cast<DWORD>(scalar * 1000.0f + 0.5f), muted ? 1U : 0U);
+    WriteEapoPreampFromState(registryPath, static_cast<DWORD>(scalar * 1000.0f + 0.5f), muted ? 1U : 0U);
 
     if (interactiveConsole)
     {
@@ -786,7 +832,7 @@ int RunVolumeMirror(const Options& options, bool interactiveConsole)
         {
             WriteDwordValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueVolumeScalar), scalarMilli);
             WriteDwordValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueMute), muteDword);
-            WriteEapoPreampFromState(scalarMilli, muteDword);
+            WriteEapoPreampFromState(registryPath, scalarMilli, muteDword);
             lastScalar = scalarMilli;
             lastMute = muteDword;
             if (interactiveConsole)

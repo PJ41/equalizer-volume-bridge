@@ -50,6 +50,12 @@ Use elevated PowerShell:
 .\installer\install-volume-mirror-service.ps1 -FriendlyMatch "Zgmicro AUDIO"
 ```
 
+One-stop setup (installs Equalizer APO if missing, builds service if needed, installs/starts service):
+
+```powershell
+.\installer\setup-one-stop.ps1 -InstallEqualizerApoIfMissing -BuildService -AutoSelectEqualizerApoDevice -RestartAudioAfterSetup -FriendlyMatch "Zgmicro AUDIO"
+```
+
 Optional hardware-scoped targeting:
 
 ```powershell
@@ -61,3 +67,5 @@ Optional hardware-scoped targeting:
 ```
 
 This installs and starts `EqualizerVolumeBridgeSvc` as `Automatic`, so it persists across reboot and replug without repeated manual steps.
+
+The setup script attempts to auto-select the bound endpoint for Equalizer APO. If endpoint loudness still does not follow Windows volume, run Equalizer APO Configurator once and ensure the target playback device is selected.
