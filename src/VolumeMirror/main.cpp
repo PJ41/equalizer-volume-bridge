@@ -1,0 +1,900 @@
+#include <Windows.h>
+#include <Shellapi.h>
+#include <cfgmgr32.h>
+#include <propkeydef.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <initguid.h>
+#include <devpkey.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+#include <propvarutil.h>
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cmath>
+#include <cwctype>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "SharedConfig.h"
+
+using Microsoft::WRL::ComPtr;
+
+namespace
+{
+constexpr wchar_t kServiceName[] = L"EqualizerVolumeBridgeSvc";
+constexpr wchar_t kEapoBridgePath[] = L"C:\\Program Files\\EqualizerAPO\\config\\equalizer-volume-bridge.txt";
+constexpr const char* kEapoMainConfigPath = "C:\\Program Files\\EqualizerAPO\\config\\config.txt";
+constexpr const char* kEapoBlockBegin = "# EQUALIZER_VOLUME_BRIDGE_BEGIN";
+constexpr const char* kEapoBlockEnd = "# EQUALIZER_VOLUME_BRIDGE_END";
+
+std::atomic_bool g_keepRunning{ true };
+SERVICE_STATUS_HANDLE g_serviceStatusHandle = nullptr;
+SERVICE_STATUS g_serviceStatus{};
+
+struct Options
+{
+    std::wstring friendlyMatch = L"Zgmicro AUDIO";
+    std::wstring hardwareIdMatch;
+    std::wstring deviceIdOverride;
+    bool validateOnly = false;
+};
+
+void HandleSignal(int) noexcept
+{
+    g_keepRunning = false;
+}
+
+std::wstring ToWide(const std::string& s)
+{
+    if (s.empty())
+    {
+        return {};
+    }
+
+    const int needed = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (needed <= 0)
+    {
+        return {};
+    }
+
+    std::wstring result(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), result.data(), needed);
+    return result;
+}
+
+void WriteDwordValue(HKEY root, const std::wstring& path, const std::wstring& valueName, DWORD value)
+{
+    HKEY key = nullptr;
+    const LONG createResult = RegCreateKeyExW(
+        root,
+        path.c_str(),
+        0,
+        nullptr,
+        REG_OPTION_NON_VOLATILE,
+        KEY_SET_VALUE,
+        nullptr,
+        &key,
+        nullptr);
+
+    if (createResult != ERROR_SUCCESS)
+    {
+        throw std::runtime_error("RegCreateKeyExW failed.");
+    }
+
+    const LONG setResult = RegSetValueExW(
+        key,
+        valueName.c_str(),
+        0,
+        REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value),
+        sizeof(value));
+
+    RegCloseKey(key);
+
+    if (setResult != ERROR_SUCCESS)
+    {
+        throw std::runtime_error("RegSetValueExW failed.");
+    }
+}
+
+void WriteStringValue(HKEY root, const std::wstring& path, const std::wstring& valueName, const std::wstring& value)
+{
+    HKEY key = nullptr;
+    const LONG createResult = RegCreateKeyExW(
+        root,
+        path.c_str(),
+        0,
+        nullptr,
+        REG_OPTION_NON_VOLATILE,
+        KEY_SET_VALUE,
+        nullptr,
+        &key,
+        nullptr);
+
+    if (createResult != ERROR_SUCCESS)
+    {
+        throw std::runtime_error("RegCreateKeyExW failed.");
+    }
+
+    const DWORD bytes = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
+    const LONG setResult = RegSetValueExW(
+        key,
+        valueName.c_str(),
+        0,
+        REG_SZ,
+        reinterpret_cast<const BYTE*>(value.c_str()),
+        bytes);
+
+    RegCloseKey(key);
+
+    if (setResult != ERROR_SUCCESS)
+    {
+        throw std::runtime_error("RegSetValueExW failed.");
+    }
+}
+
+std::wstring ReadStringValue(HKEY root, const std::wstring& path, const std::wstring& valueName)
+{
+    HKEY key = nullptr;
+    const LONG openResult = RegOpenKeyExW(root, path.c_str(), 0, KEY_QUERY_VALUE, &key);
+    if (openResult != ERROR_SUCCESS)
+    {
+        return {};
+    }
+
+    DWORD valueType = 0;
+    DWORD bytes = 0;
+    const LONG queryResult = RegQueryValueExW(key, valueName.c_str(), nullptr, &valueType, nullptr, &bytes);
+    if (queryResult != ERROR_SUCCESS || valueType != REG_SZ || bytes < sizeof(wchar_t))
+    {
+        RegCloseKey(key);
+        return {};
+    }
+
+    std::wstring value(bytes / sizeof(wchar_t), L'\0');
+    const LONG readResult = RegQueryValueExW(
+        key,
+        valueName.c_str(),
+        nullptr,
+        &valueType,
+        reinterpret_cast<LPBYTE>(value.data()),
+        &bytes);
+
+    RegCloseKey(key);
+    if (readResult != ERROR_SUCCESS)
+    {
+        return {};
+    }
+
+    if (!value.empty() && value.back() == L'\0')
+    {
+        value.pop_back();
+    }
+    return value;
+}
+
+void WriteEapoPreampFromState(DWORD scalarMilli, DWORD muteDword)
+{
+    const double scalar = static_cast<double>(std::clamp<DWORD>(scalarMilli, 0, 1000)) / 1000.0;
+    const double gain = (muteDword != 0) ? 0.0 : scalar;
+    const double gainDb = (gain < 0.000001) ? -120.0 : (20.0 * std::log10(gain));
+
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, kEapoBridgePath, L"wb") != 0 || file == nullptr)
+    {
+        return;
+    }
+
+    fwprintf(file, L"# Auto-generated by EqualizerVolumeBridgeSvc\r\n");
+    fwprintf(file, L"Preamp: %.2f dB\r\n", gainDb);
+    fclose(file);
+
+    std::ifstream in(kEapoMainConfigPath, std::ios::binary);
+    if (!in.is_open())
+    {
+        return;
+    }
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+
+    std::ostringstream block;
+    block << kEapoBlockBegin << "\r\n";
+    block << "Preamp: " << std::fixed << std::setprecision(2) << gainDb << " dB\r\n";
+    block << kEapoBlockEnd << "\r\n";
+    const std::string blockStr = block.str();
+
+    const std::string beginMarker(kEapoBlockBegin);
+    const std::string endMarker(kEapoBlockEnd);
+    const size_t beginPos = content.find(beginMarker);
+    if (beginPos != std::string::npos)
+    {
+        const size_t endPos = content.find(endMarker, beginPos);
+        if (endPos != std::string::npos)
+        {
+            size_t replaceEnd = endPos + endMarker.size();
+            if (replaceEnd + 2 <= content.size() && content.substr(replaceEnd, 2) == "\r\n")
+            {
+                replaceEnd += 2;
+            }
+            content.replace(beginPos, replaceEnd - beginPos, blockStr);
+        }
+        else
+        {
+            content.append("\r\n");
+            content.append(blockStr);
+        }
+    }
+    else
+    {
+        if (!content.empty() && content.back() != '\n')
+        {
+            content.append("\r\n");
+        }
+        content.append(blockStr);
+    }
+
+    std::ofstream out(kEapoMainConfigPath, std::ios::binary | std::ios::trunc);
+    if (!out.is_open())
+    {
+        return;
+    }
+    out.write(content.data(), static_cast<std::streamsize>(content.size()));
+    out.close();
+}
+
+bool ContainsCaseInsensitive(const std::wstring& haystack, const std::wstring& needle)
+{
+    if (needle.empty())
+    {
+        return true;
+    }
+
+    std::wstring lowerHaystack = haystack;
+    std::wstring lowerNeedle = needle;
+    CharLowerBuffW(lowerHaystack.data(), static_cast<DWORD>(lowerHaystack.size()));
+    CharLowerBuffW(lowerNeedle.data(), static_cast<DWORD>(lowerNeedle.size()));
+    return lowerHaystack.find(lowerNeedle) != std::wstring::npos;
+}
+
+std::vector<std::wstring> SplitPatterns(const std::wstring& input)
+{
+    std::vector<std::wstring> parts;
+    std::wstring current;
+    for (wchar_t c : input)
+    {
+        if (c == L';' || c == L',')
+        {
+            if (!current.empty())
+            {
+                parts.push_back(current);
+                current.clear();
+            }
+        }
+        else if (!iswspace(c))
+        {
+            current.push_back(c);
+        }
+    }
+
+    if (!current.empty())
+    {
+        parts.push_back(current);
+    }
+    return parts;
+}
+
+bool MatchesAnyPattern(const std::wstring& haystack, const std::wstring& patternsDelimited)
+{
+    const auto parts = SplitPatterns(patternsDelimited);
+    if (parts.empty())
+    {
+        return patternsDelimited.empty();
+    }
+
+    for (const auto& part : parts)
+    {
+        if (ContainsCaseInsensitive(haystack, part))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring PnpInstanceIdForCfgMgr(const std::wstring& instanceIdOrHaystack)
+{
+    const size_t sp = instanceIdOrHaystack.find(L' ');
+    if (sp == std::wstring::npos)
+    {
+        return instanceIdOrHaystack;
+    }
+    return instanceIdOrHaystack.substr(0, sp);
+}
+
+bool InstanceOrAncestorsMatchPattern(const std::wstring& deviceInstanceId, const std::wstring& pattern)
+{
+    if (pattern.empty())
+    {
+        return true;
+    }
+
+    if (ContainsCaseInsensitive(deviceInstanceId, pattern))
+    {
+        return true;
+    }
+
+    const std::wstring pnpId = PnpInstanceIdForCfgMgr(deviceInstanceId);
+    DEVINST devInst = 0;
+    CONFIGRET cr = CM_Locate_DevNodeW(&devInst, const_cast<LPWSTR>(pnpId.c_str()), CM_LOCATE_DEVNODE_NORMAL);
+    if (cr != CR_SUCCESS)
+    {
+        return false;
+    }
+
+    for (int depth = 0; depth < 32; ++depth)
+    {
+        wchar_t buffer[MAX_DEVICE_ID_LEN] = {};
+        cr = CM_Get_Device_IDW(devInst, buffer, MAX_DEVICE_ID_LEN, 0);
+        if (cr == CR_SUCCESS && ContainsCaseInsensitive(buffer, pattern))
+        {
+            return true;
+        }
+
+        DEVINST parent = 0;
+        cr = CM_Get_Parent(&parent, devInst, 0);
+        if (cr != CR_SUCCESS)
+        {
+            break;
+        }
+        devInst = parent;
+    }
+
+    return false;
+}
+
+bool HardwarePatternsMatchInstanceTree(const std::wstring& deviceInstanceId, const std::wstring& patternsDelimited)
+{
+    const auto parts = SplitPatterns(patternsDelimited);
+    if (parts.empty())
+    {
+        return true;
+    }
+
+    for (const auto& part : parts)
+    {
+        if (InstanceOrAncestorsMatchPattern(deviceInstanceId, part))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+Options ParseOptionsWide(int argc, wchar_t** argv)
+{
+    Options options;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if (wcscmp(argv[i], L"--validate") == 0)
+        {
+            options.validateOnly = true;
+        }
+        else if (wcscmp(argv[i], L"--friendly") == 0 && i + 1 < argc)
+        {
+            options.friendlyMatch = argv[++i];
+        }
+        else if (wcscmp(argv[i], L"--device-id") == 0 && i + 1 < argc)
+        {
+            options.deviceIdOverride = argv[++i];
+        }
+        else if (wcscmp(argv[i], L"--hwid-match") == 0 && i + 1 < argc)
+        {
+            options.hardwareIdMatch = argv[++i];
+        }
+        else if (wcscmp(argv[i], L"--help") == 0 || wcscmp(argv[i], L"-h") == 0)
+        {
+            std::wcout
+                << L"Usage:\n"
+                << L"  EqualizerVolumeBridgeSvc.exe [--validate] [--friendly <name>] [--hwid-match <idpart>] [--device-id <id>]\n\n"
+                << L"Examples:\n"
+                << L"  EqualizerVolumeBridgeSvc.exe --validate --friendly \"Zgmicro AUDIO\"\n"
+                << L"  EqualizerVolumeBridgeSvc.exe --friendly \"Zgmicro AUDIO\" --hwid-match \"VID_0C76&PID_161E\"\n"
+                << L"  EqualizerVolumeBridgeSvc.exe --device-id \"{0.0.0.00000000}.{...}\"\n";
+            std::exit(0);
+        }
+    }
+
+    return options;
+}
+
+std::wstring GetDeviceId(IMMDevice* device)
+{
+    LPWSTR id = nullptr;
+    if (FAILED(device->GetId(&id)))
+    {
+        return {};
+    }
+    std::wstring result(id);
+    CoTaskMemFree(id);
+    return result;
+}
+
+std::wstring GetFriendlyName(IMMDevice* device)
+{
+    ComPtr<IPropertyStore> props;
+    if (FAILED(device->OpenPropertyStore(STGM_READ, &props)))
+    {
+        return {};
+    }
+
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    const HRESULT hr = props->GetValue(PKEY_Device_FriendlyName, &value);
+    if (FAILED(hr) || value.vt != VT_LPWSTR || value.pwszVal == nullptr)
+    {
+        PropVariantClear(&value);
+        return {};
+    }
+
+    std::wstring result(value.pwszVal);
+    PropVariantClear(&value);
+    return result;
+}
+
+std::wstring GetInstanceId(IMMDevice* device)
+{
+    ComPtr<IPropertyStore> props;
+    if (FAILED(device->OpenPropertyStore(STGM_READ, &props)))
+    {
+        return {};
+    }
+
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    const HRESULT hr = props->GetValue(PKEY_Device_InstanceId, &value);
+    if (FAILED(hr) || value.vt != VT_LPWSTR || value.pwszVal == nullptr)
+    {
+        PropVariantClear(&value);
+        return {};
+    }
+
+    std::wstring result(value.pwszVal);
+    PropVariantClear(&value);
+    return result;
+}
+
+// InstanceId for render endpoints is often SWD\MMDEVAPI\... (no VID/PID text). HardwareIds on the
+// same property store include USB\VID_...&PID_...; cfgmgr parent walk also fails for SWD. Concatenate
+// both so SupportedHardwareIds / --hwid-match can still match.
+std::wstring GetDeviceHwidMatchHaystack(IMMDevice* device)
+{
+    std::wstring result = GetInstanceId(device);
+    ComPtr<IPropertyStore> store;
+    if (FAILED(device->OpenPropertyStore(STGM_READ, &store)))
+    {
+        return result;
+    }
+
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    PROPERTYKEY hardwareIdsKey{};
+    hardwareIdsKey.fmtid = DEVPKEY_Device_HardwareIds.fmtid;
+    hardwareIdsKey.pid = static_cast<DWORD>(DEVPKEY_Device_HardwareIds.pid);
+    const HRESULT hr = store->GetValue(hardwareIdsKey, &value);
+    if (SUCCEEDED(hr) && (value.vt == (VT_VECTOR | VT_LPWSTR)) && value.calpwstr.cElems > 0 && value.calpwstr.pElems != nullptr)
+    {
+        for (ULONG i = 0; i < value.calpwstr.cElems; ++i)
+        {
+            if (value.calpwstr.pElems[i] != nullptr)
+            {
+                result += L' ';
+                result += value.calpwstr.pElems[i];
+            }
+        }
+    }
+    PropVariantClear(&value);
+    return result;
+}
+
+class EndpointVolumeCallback final : public IAudioEndpointVolumeCallback
+{
+public:
+    EndpointVolumeCallback(const std::wstring& registryPath, bool verbose) :
+        m_registryPath(registryPath),
+        m_verbose(verbose)
+    {
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppvObject) override
+    {
+        if (ppvObject == nullptr)
+        {
+            return E_POINTER;
+        }
+
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IAudioEndpointVolumeCallback))
+        {
+            *ppvObject = static_cast<IAudioEndpointVolumeCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+
+        *ppvObject = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_refCount));
+    }
+
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        const LONG refs = InterlockedDecrement(&m_refCount);
+        if (refs == 0)
+        {
+            delete this;
+        }
+        return static_cast<ULONG>(refs);
+    }
+
+    STDMETHODIMP OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA data) override
+    {
+        if (data == nullptr)
+        {
+            return E_POINTER;
+        }
+
+        const DWORD scalarMilli = static_cast<DWORD>(data->fMasterVolume * 1000.0f + 0.5f);
+        const DWORD mute = data->bMuted ? 1U : 0U;
+
+        try
+        {
+            WriteDwordValue(HKEY_LOCAL_MACHINE, m_registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueVolumeScalar), scalarMilli);
+            WriteDwordValue(HKEY_LOCAL_MACHINE, m_registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueMute), mute);
+        }
+        catch (...)
+        {
+            return E_FAIL;
+        }
+
+        if (m_verbose)
+        {
+            std::wcout
+                << L"[notify] scalar=" << data->fMasterVolume
+                << L" (" << scalarMilli << L"/1000), mute=" << (mute ? L"true" : L"false")
+                << L"\n";
+        }
+
+        return S_OK;
+    }
+
+private:
+    std::wstring m_registryPath;
+    bool m_verbose{ false };
+    LONG m_refCount{ 1 };
+};
+
+ComPtr<IMMDevice> FindTargetRenderDevice(
+    IMMDeviceEnumerator* enumerator,
+    const std::wstring& explicitDeviceId,
+    const std::wstring& friendlyMatch,
+    const std::wstring& hardwareIdMatch)
+{
+    ComPtr<IMMDeviceCollection> collection;
+    if (FAILED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection)))
+    {
+        return nullptr;
+    }
+
+    UINT count = 0;
+    collection->GetCount(&count);
+    for (UINT i = 0; i < count; ++i)
+    {
+        ComPtr<IMMDevice> device;
+        if (FAILED(collection->Item(i, &device)))
+        {
+            continue;
+        }
+
+        const std::wstring name = GetFriendlyName(device.Get());
+        const std::wstring hwidHaystack = GetDeviceHwidMatchHaystack(device.Get());
+        const bool friendlyOk = ContainsCaseInsensitive(name, friendlyMatch);
+        const bool hwidOk = hardwareIdMatch.empty() || HardwarePatternsMatchInstanceTree(hwidHaystack, hardwareIdMatch);
+        if (friendlyOk && hwidOk)
+        {
+            return device;
+        }
+    }
+
+    if (!explicitDeviceId.empty())
+    {
+        ComPtr<IMMDevice> selected;
+        if (SUCCEEDED(enumerator->GetDevice(explicitDeviceId.c_str(), &selected)))
+        {
+            return selected;
+        }
+    }
+
+    return nullptr;
+}
+
+int RunVolumeMirror(const Options& options, bool interactiveConsole)
+{
+    Options opts = options;
+
+    const std::wstring registryPath(equalizer_bridge::shared_config::kRegistryPath);
+    std::wstring configuredDeviceId = ReadStringValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueDeviceId));
+    std::wstring configuredHardwareIds = ReadStringValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueSupportedHardwareIds));
+    if (!opts.deviceIdOverride.empty())
+    {
+        configuredDeviceId = opts.deviceIdOverride;
+    }
+    if (opts.hardwareIdMatch.empty() && !configuredHardwareIds.empty())
+    {
+        opts.hardwareIdMatch = configuredHardwareIds;
+    }
+
+    if (configuredDeviceId.empty())
+    {
+        WriteStringValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueFriendlyMatch), opts.friendlyMatch);
+        WriteStringValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueHardwareIdMatch), opts.hardwareIdMatch);
+        WriteStringValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueSupportedHardwareIds), opts.hardwareIdMatch);
+    }
+
+    const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr))
+    {
+        if (interactiveConsole)
+        {
+            std::cerr << "CoInitializeEx failed.\n";
+        }
+        return 1;
+    }
+
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator))))
+    {
+        if (interactiveConsole)
+        {
+            std::cerr << "Failed to create MMDeviceEnumerator.\n";
+        }
+        CoUninitialize();
+        return 1;
+    }
+
+    ComPtr<IMMDevice> device;
+    ComPtr<IAudioEndpointVolume> endpointVolume;
+    EndpointVolumeCallback* callback = nullptr;
+    bool callbackRegistered = false;
+    auto BindEndpoint = [&]() -> bool {
+        if (callbackRegistered && endpointVolume && callback)
+        {
+            endpointVolume->UnregisterControlChangeNotify(callback);
+            callbackRegistered = false;
+        }
+        endpointVolume.Reset();
+        device.Reset();
+
+        const std::wstring latestConfiguredDeviceId = ReadStringValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueDeviceId));
+        device = FindTargetRenderDevice(enumerator.Get(), latestConfiguredDeviceId, opts.friendlyMatch, opts.hardwareIdMatch);
+        if (!device)
+        {
+            return false;
+        }
+
+        const std::wstring boundDeviceId = GetDeviceId(device.Get());
+        WriteStringValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueDeviceId), boundDeviceId);
+
+        if (FAILED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(endpointVolume.GetAddressOf()))))
+        {
+            return false;
+        }
+
+        if (callback == nullptr)
+        {
+            callback = new EndpointVolumeCallback(registryPath, interactiveConsole);
+        }
+        if (callback != nullptr && SUCCEEDED(endpointVolume->RegisterControlChangeNotify(callback)))
+        {
+            callbackRegistered = true;
+        }
+        return true;
+    };
+
+    if (!BindEndpoint())
+    {
+        if (interactiveConsole)
+        {
+            std::wcerr << L"Could not bind target render endpoint matching '" << opts.friendlyMatch << L"'.\n";
+        }
+        if (callback != nullptr)
+        {
+            callback->Release();
+        }
+        CoUninitialize();
+        return 2;
+    }
+
+    float scalar = 1.0f;
+    BOOL muted = FALSE;
+    endpointVolume->GetMasterVolumeLevelScalar(&scalar);
+    endpointVolume->GetMute(&muted);
+
+    WriteDwordValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueVolumeScalar), static_cast<DWORD>(scalar * 1000.0f + 0.5f));
+    WriteDwordValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueMute), muted ? 1U : 0U);
+    WriteEapoPreampFromState(static_cast<DWORD>(scalar * 1000.0f + 0.5f), muted ? 1U : 0U);
+
+    if (interactiveConsole)
+    {
+        std::wcout << L"Listening for volume changes on: " << GetFriendlyName(device.Get()) << L"\n";
+        std::wcout << L"Device Id: " << GetDeviceId(device.Get()) << L"\n";
+        std::wcout << L"Registry sync path: HKLM\\" << registryPath << L"\n";
+        std::wcout << L"Initial scalar: " << scalar << L", muted=" << (muted ? L"true" : L"false") << L"\n";
+        if (opts.validateOnly)
+        {
+            std::wcout << L"Validation mode enabled: move master volume keys/slider to verify scalar changes.\n";
+        }
+        std::wcout << L"Press Ctrl+C to exit.\n";
+    }
+
+    DWORD lastScalar = static_cast<DWORD>(scalar * 1000.0f + 0.5f);
+    DWORD lastMute = muted ? 1U : 0U;
+    int consecutiveReadFailures = 0;
+
+    while (g_keepRunning.load())
+    {
+        if (!endpointVolume)
+        {
+            if (!BindEndpoint())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+        }
+
+        float polledScalar = 1.0f;
+        BOOL polledMute = FALSE;
+        const HRESULT hrScalar = endpointVolume->GetMasterVolumeLevelScalar(&polledScalar);
+        const HRESULT hrMute = endpointVolume->GetMute(&polledMute);
+        if (FAILED(hrScalar) || FAILED(hrMute))
+        {
+            ++consecutiveReadFailures;
+            if (consecutiveReadFailures >= 3)
+            {
+                BindEndpoint();
+                consecutiveReadFailures = 0;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        consecutiveReadFailures = 0;
+
+        const DWORD scalarMilli = static_cast<DWORD>(polledScalar * 1000.0f + 0.5f);
+        const DWORD muteDword = polledMute ? 1U : 0U;
+        if (scalarMilli != lastScalar || muteDword != lastMute)
+        {
+            WriteDwordValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueVolumeScalar), scalarMilli);
+            WriteDwordValue(HKEY_LOCAL_MACHINE, registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueMute), muteDword);
+            WriteEapoPreampFromState(scalarMilli, muteDword);
+            lastScalar = scalarMilli;
+            lastMute = muteDword;
+            if (interactiveConsole)
+            {
+                std::wcout << L"[poll] scalar=" << polledScalar << L" (" << scalarMilli
+                    << L"/1000), mute=" << (muteDword ? L"true" : L"false") << L"\n";
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (callbackRegistered && endpointVolume && callback)
+    {
+        endpointVolume->UnregisterControlChangeNotify(callback);
+    }
+    if (callback != nullptr)
+    {
+        callback->Release();
+    }
+    CoUninitialize();
+    return 0;
+}
+
+VOID WINAPI ServiceCtrlHandler(DWORD ctrl)
+{
+    if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN)
+    {
+        g_keepRunning = false;
+        if (g_serviceStatusHandle != nullptr)
+        {
+            g_serviceStatus.dwWin32ExitCode = 0;
+            g_serviceStatus.dwCheckPoint = 0;
+            g_serviceStatus.dwWaitHint = 0;
+            g_serviceStatus.dwCurrentState = SERVICE_STOP_PENDING;
+            SetServiceStatus(g_serviceStatusHandle, &g_serviceStatus);
+        }
+    }
+}
+
+VOID WINAPI ServiceMain(DWORD /*argc*/, LPWSTR* /*argv*/)
+{
+    g_serviceStatusHandle = RegisterServiceCtrlHandlerW(kServiceName, ServiceCtrlHandler);
+    if (g_serviceStatusHandle == nullptr)
+    {
+        return;
+    }
+
+    ZeroMemory(&g_serviceStatus, sizeof(g_serviceStatus));
+    g_serviceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_serviceStatus.dwCurrentState = SERVICE_START_PENDING;
+    g_serviceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    SetServiceStatus(g_serviceStatusHandle, &g_serviceStatus);
+
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv == nullptr)
+    {
+        g_serviceStatus.dwCurrentState = SERVICE_STOPPED;
+        g_serviceStatus.dwWin32ExitCode = ERROR_OUTOFMEMORY;
+        SetServiceStatus(g_serviceStatusHandle, &g_serviceStatus);
+        return;
+    }
+
+    Options options = ParseOptionsWide(wargc, wargv);
+    LocalFree(wargv);
+
+    g_serviceStatus.dwCurrentState = SERVICE_RUNNING;
+    SetServiceStatus(g_serviceStatusHandle, &g_serviceStatus);
+
+    const int exitCode = RunVolumeMirror(options, false);
+
+    g_serviceStatus.dwCurrentState = SERVICE_STOPPED;
+    g_serviceStatus.dwWin32ExitCode = exitCode == 0 ? 0 : ERROR_SERVICE_SPECIFIC_ERROR;
+    g_serviceStatus.dwServiceSpecificExitCode = static_cast<DWORD>(exitCode);
+    SetServiceStatus(g_serviceStatusHandle, &g_serviceStatus);
+}
+} // namespace
+
+int main()
+{
+    std::signal(SIGINT, HandleSignal);
+    std::signal(SIGTERM, HandleSignal);
+
+    SERVICE_TABLE_ENTRYW serviceTable[] = {
+        { const_cast<LPWSTR>(kServiceName), ServiceMain },
+        { nullptr, nullptr }
+    };
+
+    if (!StartServiceCtrlDispatcherW(serviceTable))
+    {
+        const DWORD err = GetLastError();
+        if (err != ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
+        {
+            return static_cast<int>(err);
+        }
+
+        int wargc = 0;
+        LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        if (wargv == nullptr)
+        {
+            return 1;
+        }
+
+        Options options = ParseOptionsWide(wargc, wargv);
+        LocalFree(wargv);
+        return RunVolumeMirror(options, true);
+    }
+
+    return 0;
+}

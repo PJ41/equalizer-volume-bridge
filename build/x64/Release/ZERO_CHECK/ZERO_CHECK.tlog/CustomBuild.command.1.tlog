@@ -1,0 +1,10 @@
+^C:\USERS\PJ\DOCUMENTS\EQUALIZER-VOLUME-BRIDGE\BUILD\CMAKEFILES\65774A858C715DBA1289B97392A9FEB5\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/PJ/Documents/equalizer-volume-bridge -BC:/Users/PJ/Documents/equalizer-volume-bridge/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/PJ/Documents/equalizer-volume-bridge/build/equalizer_volume_bridge.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

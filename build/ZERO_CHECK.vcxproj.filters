@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\PJ\Documents\equalizer-volume-bridge\build\CMakeFiles\65774a858c715dba1289b97392a9feb5\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{FA1C3CB0-3979-3064-B31E-B3728101F9CC}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

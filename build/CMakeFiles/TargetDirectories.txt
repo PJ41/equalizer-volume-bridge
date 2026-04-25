@@ -1,0 +1,3 @@
+C:/Users/PJ/Documents/equalizer-volume-bridge/build/CMakeFiles/EqualizerVolumeBridgeSvc.dir
+C:/Users/PJ/Documents/equalizer-volume-bridge/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/PJ/Documents/equalizer-volume-bridge/build/CMakeFiles/ZERO_CHECK.dir
