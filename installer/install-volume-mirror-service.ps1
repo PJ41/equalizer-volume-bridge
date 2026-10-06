@@ -67,6 +67,11 @@ if ($null -ne $existing) {
 New-Service -Name $ServiceName -BinaryPathName $escapedBinary -DisplayName "Equalizer Volume Bridge Service" -Description "Mirrors endpoint master volume into registry and Equalizer APO preamp state." -StartupType Automatic | Out-Null
 Start-Service -Name $ServiceName -ErrorAction Stop
 
+# Restart even when the process reports a failed stop (speaker missing at boot used to exit immediately).
+& sc.exe failure $ServiceName reset= 86400 actions= restart/2000/restart/5000/restart/15000 | Out-Null
+& sc.exe failureflag $ServiceName 1 | Out-Null
+& sc.exe config $ServiceName depend= Audiosrv | Out-Null
+
 $s = Get-Service -Name $ServiceName
 if ($s.Status -ne "Running") {
     throw "Service did not reach Running state (Status=$($s.Status)). Check Application event log for EqualizerVolumeBridgeSvc."
@@ -74,3 +79,4 @@ if ($s.Status -ne "Running") {
 
 Write-Host "Service installed and started: $ServiceName (Status=$($s.Status))"
 Write-Host "Configured gain range: MinGainMilli=$MinGainMilli MaxGainMilli=$MaxGainMilli"
+Write-Host "Recovery: restart on failure. Startup waits for the speaker instead of exiting."

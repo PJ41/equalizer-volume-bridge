@@ -37,6 +37,7 @@ constexpr const char* kEapoBlockBegin = "# EQUALIZER_VOLUME_BRIDGE_BEGIN";
 constexpr const char* kEapoBlockEnd = "# EQUALIZER_VOLUME_BRIDGE_END";
 
 std::atomic_bool g_keepRunning{ true };
+std::atomic_bool g_rebindRequested{ false };
 SERVICE_STATUS_HANDLE g_serviceStatusHandle = nullptr;
 SERVICE_STATUS g_serviceStatus{};
 
@@ -608,6 +609,7 @@ public:
         {
             WriteDwordValue(HKEY_LOCAL_MACHINE, m_registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueVolumeScalar), scalarMilli);
             WriteDwordValue(HKEY_LOCAL_MACHINE, m_registryPath, std::wstring(equalizer_bridge::shared_config::kRegistryValueMute), mute);
+            WriteEapoPreampFromState(m_registryPath, scalarMilli, mute);
         }
         catch (...)
         {
@@ -675,6 +677,74 @@ ComPtr<IMMDevice> FindTargetRenderDevice(
     return nullptr;
 }
 
+class DeviceArrivalCallback final : public IMMNotificationClient
+{
+public:
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppvObject) override
+    {
+        if (ppvObject == nullptr)
+        {
+            return E_POINTER;
+        }
+
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient))
+        {
+            *ppvObject = static_cast<IMMNotificationClient*>(this);
+            AddRef();
+            return S_OK;
+        }
+
+        *ppvObject = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_refCount));
+    }
+
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        const LONG refs = InterlockedDecrement(&m_refCount);
+        if (refs == 0)
+        {
+            delete this;
+        }
+        return static_cast<ULONG>(refs);
+    }
+
+    STDMETHODIMP OnDeviceStateChanged(LPCWSTR /*deviceId*/, DWORD /*newState*/) override
+    {
+        g_rebindRequested.store(true);
+        return S_OK;
+    }
+
+    STDMETHODIMP OnDeviceAdded(LPCWSTR /*deviceId*/) override
+    {
+        g_rebindRequested.store(true);
+        return S_OK;
+    }
+
+    STDMETHODIMP OnDeviceRemoved(LPCWSTR /*deviceId*/) override
+    {
+        g_rebindRequested.store(true);
+        return S_OK;
+    }
+
+    STDMETHODIMP OnDefaultDeviceChanged(EDataFlow /*flow*/, ERole /*role*/, LPCWSTR /*deviceId*/) override
+    {
+        return S_OK;
+    }
+
+    STDMETHODIMP OnPropertyValueChanged(LPCWSTR /*deviceId*/, const PROPERTYKEY /*key*/) override
+    {
+        return S_OK;
+    }
+
+private:
+    LONG m_refCount{ 1 };
+};
+
 int RunVolumeMirror(const Options& options, bool interactiveConsole)
 {
     Options opts = options;
@@ -723,6 +793,33 @@ int RunVolumeMirror(const Options& options, bool interactiveConsole)
     ComPtr<IAudioEndpointVolume> endpointVolume;
     EndpointVolumeCallback* callback = nullptr;
     bool callbackRegistered = false;
+    DeviceArrivalCallback* deviceNotify = new DeviceArrivalCallback();
+    const bool deviceNotifyRegistered = SUCCEEDED(enumerator->RegisterEndpointNotificationCallback(deviceNotify));
+    auto ReleaseAudio = [&]() {
+        if (callbackRegistered && endpointVolume && callback)
+        {
+            endpointVolume->UnregisterControlChangeNotify(callback);
+            callbackRegistered = false;
+        }
+        if (deviceNotifyRegistered)
+        {
+            enumerator->UnregisterEndpointNotificationCallback(deviceNotify);
+        }
+        if (deviceNotify != nullptr)
+        {
+            deviceNotify->Release();
+            deviceNotify = nullptr;
+        }
+        if (callback != nullptr)
+        {
+            callback->Release();
+            callback = nullptr;
+        }
+        endpointVolume.Reset();
+        device.Reset();
+        enumerator.Reset();
+        CoUninitialize();
+    };
     auto BindEndpoint = [&]() -> bool {
         if (callbackRegistered && endpointVolume && callback)
         {
@@ -758,18 +855,21 @@ int RunVolumeMirror(const Options& options, bool interactiveConsole)
         return true;
     };
 
-    if (!BindEndpoint())
+    bool announcedWait = false;
+    while (!BindEndpoint())
     {
-        if (interactiveConsole)
+        if (!g_keepRunning.load())
         {
-            std::wcerr << L"Could not bind target render endpoint matching '" << opts.friendlyMatch << L"'.\n";
+            ReleaseAudio();
+            return 0;
         }
-        if (callback != nullptr)
+
+        if (interactiveConsole && !announcedWait)
         {
-            callback->Release();
+            std::wcerr << L"Waiting for render endpoint matching '" << opts.friendlyMatch << L"'...\n";
+            announcedWait = true;
         }
-        CoUninitialize();
-        return 2;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     float scalar = 1.0f;
@@ -800,12 +900,36 @@ int RunVolumeMirror(const Options& options, bool interactiveConsole)
 
     while (g_keepRunning.load())
     {
-        if (!endpointVolume)
+        const bool rebindRequested = g_rebindRequested.exchange(false);
+        if (rebindRequested || !endpointVolume)
         {
-            if (!BindEndpoint())
+            bool shouldBind = !endpointVolume;
+            if (rebindRequested && endpointVolume)
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
+                const std::wstring latestConfiguredDeviceId = ReadStringValue(
+                    HKEY_LOCAL_MACHINE,
+                    registryPath,
+                    std::wstring(equalizer_bridge::shared_config::kRegistryValueDeviceId));
+                ComPtr<IMMDevice> candidate = FindTargetRenderDevice(
+                    enumerator.Get(),
+                    latestConfiguredDeviceId,
+                    opts.friendlyMatch,
+                    opts.hardwareIdMatch);
+                const std::wstring candidateId = candidate ? GetDeviceId(candidate.Get()) : std::wstring();
+                const std::wstring currentId = device ? GetDeviceId(device.Get()) : std::wstring();
+                shouldBind = candidateId != currentId;
+            }
+
+            if (shouldBind)
+            {
+                if (!BindEndpoint())
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    continue;
+                }
+                consecutiveReadFailures = 0;
+                lastScalar = 0xFFFFFFFF;
+                lastMute = 0xFFFFFFFF;
             }
         }
 
@@ -845,15 +969,7 @@ int RunVolumeMirror(const Options& options, bool interactiveConsole)
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    if (callbackRegistered && endpointVolume && callback)
-    {
-        endpointVolume->UnregisterControlChangeNotify(callback);
-    }
-    if (callback != nullptr)
-    {
-        callback->Release();
-    }
-    CoUninitialize();
+    ReleaseAudio();
     return 0;
 }
 
